@@ -1,0 +1,786 @@
+---
+title: "survival_project"
+author: "Samuella Boadi"
+date: "2025-11-30"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+
+```{r}
+
+
+library(survival)
+library(survminer)
+library(dplyr)
+library(broom)
+library(ggplot2)
+library(tableone)
+library(splines)
+library(glmnet)
+library(MASS)
+set.seed(7210)   
+
+```
+
+
+
+
+
+```{r}
+seer <- read.csv("C:/Users/boadi/OneDrive - University of Iowa/Documents/fall2025/Fall2025/Survival/SEER Breast_Cancer.csv")
+
+glimpse(seer)
+
+
+
+seer <- seer %>%
+  rename(
+Regional.Node.Positive=Reginol.Node.Positive 
+  )
+```
+
+```{r}
+seer <- seer %>%
+  mutate(
+    # event indicator: 1 = died, 0 = alive
+    status_event = ifelse(Status == "Dead", 1, 0),
+    # survival object
+    surv_obj = Surv(time = Survival.Months, event = status_event),
+    # make categorical variables factors
+    Race                = factor(Race),
+    Marital.Status      = factor(Marital.Status),
+    T.Stage             = factor(T.Stage),
+    N.Stage             = factor(N.Stage),
+    X6th.Stage          = factor(X6th.Stage),
+    differentiate       = factor(differentiate),
+    Grade               = factor(Grade),
+    A.Stage             = factor(A.Stage),
+    Estrogen.Status     = factor(Estrogen.Status),
+    Progesterone.Status = factor(Progesterone.Status)
+  )
+```
+
+# 90% training / 10% validation split
+
+```{r}
+n <- nrow(seer)
+train_idx  <- sample(seq_len(n), size = floor(0.9 * n))
+seer_train <- seer[train_idx, ]
+seer_valid <- seer[-train_idx, ]
+
+```
+
+
+```{r}
+ggplot(seer_train, aes(x = Status, y = Age, fill = Status)) +
+  geom_boxplot() +
+  labs(title = "Age Distribution by Survival Status",
+       x = "Status", y = "Age") +
+  theme_minimal()
+
+
+```
+
+
+
+```{r}
+boxplot(Tumor.Size ~ T.Stage, data = seer_train,
+        main = "Tumor Size by T Stage",
+        ylab = "Tumor Size", xlab = "T Stage")
+
+summary(aov(Tumor.Size ~ T.Stage, data = seer_train))
+
+```
+Yes — this ANOVA result shows a very strong association between T.Stage (categorical) and Tumor.Size (continuous)
+
+#
+
+```{r}
+cat_vars  <- c("Race", "Marital.Status", "T.Stage", "N.Stage",
+               "X6th.Stage", "differentiate", "Grade", "A.Stage",
+               "Estrogen.Status", "Progesterone.Status")
+
+cont_vars <- c("Age", "Tumor.Size",
+               "Regional.Node.Examined", "Regional.Node.Positive")
+
+vars_for_table <- c(cat_vars, cont_vars)
+
+tab1 <- CreateTableOne(vars = vars_for_table,
+                       strata = "Status",    # or drop this if you want overall
+                       data = seer_train,
+                       factorVars = cat_vars)
+
+print(tab1, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+
+
+
+```
+```{r}
+library(tableone)
+library(dplyr)
+
+# Define variables
+cat_vars  <- c("Race", "Marital.Status", "T.Stage", "N.Stage",
+               "X6th.Stage", "differentiate", "Grade", "A.Stage",
+               "Estrogen.Status", "Progesterone.Status")
+
+cont_vars <- c("Age", "Tumor.Size",
+               "Regional.Node.Examined", "Regional.Node.Positive")
+
+vars_for_table <- c(cat_vars, cont_vars)
+
+# Create the table
+tab1 <- CreateTableOne(vars = vars_for_table,
+                       strata = "Status",
+                       data = seer_train,
+                       factorVars = cat_vars)
+
+# Extract as data frame
+tab_df <- as.data.frame(print(tab1, showAllLevels = TRUE, quote = FALSE,
+                              noSpaces = TRUE, printToggle = FALSE))
+
+# Add N column based on Status counts
+N_alive <- sum(seer_train$Status == "Alive")
+N_dead  <- sum(seer_train$Status == "Dead")
+
+tab_df$N <- c(N_alive, rep("", nrow(tab_df) - 1))  # add N only at header row
+
+# Print updated table
+tab_df
+
+
+```
+
+```{r}
+# Select only numeric variables
+num_vars <- seer_train |> 
+  dplyr::select(Age, Tumor.Size, Regional.Node.Examined, Regional.Node.Positive)
+
+# Compute correlation matrix
+cor_matrix <- cor(num_vars, use = "complete.obs")
+cor_matrix
+
+# Visualize correlation
+library(corrplot)
+corrplot(cor_matrix, method = "color", addCoef.col = "black")
+
+```
+
+```{r}
+library(vcd)
+
+# Function to compute Cramer's V for all categorical variable pairs
+cat_vars <- seer_train |> 
+  dplyr::select(Race, Marital.Status, T.Stage, N.Stage, X6th.Stage, A.Stage,
+         differentiate, Grade)
+
+# Compute Cramer's V for all pairs
+cramer_results <- matrix(NA, ncol = ncol(cat_vars), nrow = ncol(cat_vars),
+                         dimnames = list(names(cat_vars), names(cat_vars)))
+
+for(i in 1:ncol(cat_vars)){
+  for(j in 1:ncol(cat_vars)){
+    tbl <- table(cat_vars[[i]], cat_vars[[j]])
+    crv <- assocstats(tbl)$cramer
+    cramer_results[i,j] <- crv
+  }
+}
+
+cramer_results
+
+```
+Correlation analysis using Cramér’s V revealed substantial redundancy among the staging variables. X6th.Stage showed extremely high association with both T.Stage (V = 0.75) and N.Stage (V = 0.91), and moderate association with A.Stage (V = 0.42). Because these variables encode the same AJCC staging information, only one staging variable was retained in the final Cox model to avoid multicollinearity.
+
+Additionally, differentiate and Grade were perfectly correlated (V = 1.00), indicating that these variables duplicate the same histologic grading information. Therefore, only Grade was retained.
+
+All other correlations were low (V < 0.15), indicating no further collinearity concerns.
+
+
+
+
+
+
+
+
+```{r}
+cat_vars  <- c("Race", "Marital.Status", "N.Stage", "Grade", "A.Stage",
+               "Estrogen.Status", "Progesterone.Status")
+
+cont_vars <- c("Age", "Tumor.Size",
+               "Regional.Node.Examined", "Regional.Node.Positive")
+```
+
+
+#Univariable Cox models
+
+
+Step 1 : Do univariate analysis on all covariates and fit a multivariable model
+```{r}
+uni_vars <- c(cat_vars, cont_vars)
+
+uni_cox <- function(var, data) {
+  fml <- as.formula(paste("surv_obj ~", var))
+  fit <- coxph(fml, data = data)
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(variable = var)
+}
+
+uni_results <- lapply(uni_vars, uni_cox, data = seer_train) %>%
+  bind_rows() %>%
+  dplyr::select(variable, term, estimate, conf.low, conf.high, p.value)
+
+uni_results
+
+```
+Variables with pvalues <0.2
+
+
+```{r}
+library(dplyr)
+
+# For each variable, take the smallest p-value across its levels
+uni_summary <- uni_results %>%
+  group_by(variable) %>%
+  summarise(min_p = min(p.value, na.rm = TRUE)) %>%
+  arrange(min_p)
+
+uni_summary
+
+```
+
+```{r}
+vars_selected <- uni_summary %>%
+  filter(min_p < 0.20) %>%
+  pull(variable)
+
+vars_selected
+
+```
+
+
+# 5. Multivariable Cox model + stepwise selection
+Now we put all variables significant at p<0.2 and fit a multivariable proportional hazards model
+```{r}
+cox_full <- coxph(
+  surv_obj ~ Age +
+    Race + Marital.Status + N.Stage + Grade + A.Stage +
+    Tumor.Size + Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive,
+  data = seer_train
+)
+
+summary(cox_full)
+
+```
+
+
+
+# Step 2 and 3: Identify covariates that might be removed, refit and check for possible
+confounders
+
+From multivariable proportional hazards model in step 1, covariate with largest p-value is in marital status followed by A Stage. So lets remove and refit the model by removing marital status
+
+```{r}
+cox_1 <- coxph(
+  surv_obj ~ Age +
+    Race + N.Stage + Grade + A.Stage +
+    Tumor.Size + Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive,
+  data = seer_train
+)
+
+summary(cox_1)
+```
+
+
+```{r}
+terms_keep <- setdiff(
+  names(coef(cox_full)),
+  grep("^Marital.Status", names(coef(cox_full)), value = TRUE)
+)
+
+f <- data.frame(
+  term       = terms_keep,
+  per_change = round(
+    abs( (coef(cox_full)[terms_keep] - coef(cox_1)[terms_keep]) /
+           coef(cox_full)[terms_keep] ),
+    4
+  )
+)
+
+f
+```
+
+Marital.Status is neither a confounder nor a meaningful predictor in your multivariable survival model.
+
+Lets check A.stage
+```{r}
+cox_3 <- coxph(
+  surv_obj ~ Age +
+    Race +Grade +Tumor.Size + N.Stage+ Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive,
+  data = seer_train
+)
+
+summary(cox_3)
+```
+
+
+```{r}
+terms_keep <- setdiff(
+  names(coef(cox_1)),
+  grep("^A.Stage", names(coef(cox_1)), value = TRUE)
+)
+
+f <- data.frame(
+  term       = terms_keep,
+  per_change = round(
+    abs( (coef(cox_1)[terms_keep] - coef(cox_3)[terms_keep]) /
+           coef(cox_1)[terms_keep] ),
+    4
+  )
+)
+
+f
+```
+
+
+A Stage is not a confounder and can be removed.
+
+
+
+#Step 4: Add back, one at a time, all variables excluded from the initial multivariable model
+
+No variables were excluded from the univariate analysis. Thus our preliminary main effect model is 
+```{r}
+cox_main <- coxph(
+  surv_obj ~ Age +
+    Race + N.Stage + Grade +
+    Tumor.Size + Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive,
+  data = seer_train
+)
+
+summary(cox_main)
+```
+#Step 5: Examine the scale of the continuous covariates
+
+
+```{r}
+cox_main <- coxph(
+  surv_obj ~ pspline(Age) +
+    Race +
+    N.Stage + Grade +
+    pspline(Tumor.Size) + Estrogen.Status + Progesterone.Status +
+    pspline(Regional.Node.Examined) + pspline(Regional.Node.Positive),
+  data = seer_train
+)
+
+summary(cox_main)
+```
+
+```{r}
+par(mfrow = c(2,2))
+
+termplot(cox_main, se=T, terms= 1, ylabs = "Log Hazard")
+termplot(cox_main, se=T, terms= 5, ylabs = "Log Hazard")
+termplot(cox_main, se=T, terms= 8, ylabs = "Log Hazard")
+termplot(cox_main, se=T, terms= 9, ylabs = "Log Hazard")
+
+```
+
+Clearly, Tumor size, Regional node examined, and Regional node positive can be modelled as linear.I choose to model age as linear for simplicity sake.
+
+#Step6:  Interaction model
+
+
+
+
+
+```{r}
+cox_int <- coxph(
+  surv_obj ~ (Age +
+    Race + N.Stage + Grade + A.Stage +
+    Tumor.Size + Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive)^2,
+  data = seer_train
+)
+
+cox_int
+
+```
+
+Interactions are not significant. Thus, we will use the step AIC method to find the optimal model
+
+
+
+```{r}
+cox_step <- stepAIC(cox_int, direction = "both", trace = TRUE)
+summary(cox_step)
+
+
+```
+
+
+```{r}
+cox_step <- coxph(
+  surv_obj ~ 
+    Age +
+    Race +
+    N.Stage +
+    Grade +
+    Tumor.Size +
+    Estrogen.Status +
+    Progesterone.Status +
+    Regional.Node.Examined +
+    Regional.Node.Positive +
+    
+    # Interaction terms selected by stepAIC
+    Age:Grade +
+    Race:Estrogen.Status +
+    Race:Progesterone.Status +
+    N.Stage:Tumor.Size +
+    Grade:Regional.Node.Positive +
+    Grade:Regional.Node.Examined +
+    Tumor.Size:Estrogen.Status +
+    Tumor.Size:Progesterone.Status +
+    Estrogen.Status:Regional.Node.Examined +
+    Regional.Node.Examined:Regional.Node.Positive,
+    
+  data = seer_train
+)
+cox_step
+```
+
+
+
+```{r}
+library(lmtest)
+
+
+lrtest(cox_main, cox_step)
+```
+A likelihood ratio test comparing the main-effects Cox model to a model including all two-way interactions identified during model selection showed a significant improvement in model fit (chi-square = 158.6, df = 121, p = 0.012). Therefore, the interaction model was retained as the final multivariable model.
+
+The likelihood ratio test comparing the spline-based main-effects Cox model (cox_main) with the interaction model selected by AIC (cox_step) indicated no significant improvement in model fit (χ² = 7.14, df = 7, p = 0.36).
+
+Therefore, the more complex interaction model does not provide a statistically meaningful improvement over the simpler spline-adjusted model.
+
+For parsimony and interpretability, the spline main-effects model is preferred
+
+# Final model
+
+
+```{r}
+cox_final <- coxph(
+  surv_obj ~ (Age +
+    Race + N.Stage + Grade + A.Stage +
+    Tumor.Size + Estrogen.Status + Progesterone.Status +
+    Regional.Node.Examined + Regional.Node.Positive),
+  data = seer_train
+)
+
+cox_final
+```
+
+
+# Step 7: Checking assumptions and Model Diagnosis
+
+```{r}
+test_ph_rank = cox.zph(cox_final, transform = "rank")
+test_ph_rank
+plot(test_ph_rank)
+```
+
+
+
+
+```{r}
+cox_strat <- coxph(
+  surv_obj ~ Age + Race + N.Stage + Grade + Tumor.Size +
+    Regional.Node.Examined + Regional.Node.Positive +
+    strata(Estrogen.Status) +
+    strata(Progesterone.Status),
+  data = seer_train
+)
+
+summary(cox_strat)
+
+```
+```{r}
+test_ph_rank = cox.zph(cox_strat, transform = "rank")
+test_ph_rank
+```
+
+After stratifying on Estrogen.Status and Progesterone.Status, the Cox model fully satisfies the proportional hazards assumption, as indicated by non-significant PH tests for all covariates and a strong global p-value (0.94).
+
+
+```{r}
+dfb <- residuals(cox_strat, type = "dfbeta")
+index.obs <- 1:nrow(dfb)
+
+coef_names <- colnames(dfb)
+coef_names
+
+
+par(mfrow = c(3, 3))   # adjust grid as needed
+
+for (j in 1:ncol(dfb)) {
+  plot(index.obs, dfb[, j], type = "h",
+       xlab = "Observation",
+       ylab = paste("DFBETA for", coef_names[j]),
+       main = coef_names[j])
+  abline(h = 0, col = "red")
+}
+
+dfb <- residuals(cox_strat, type = "dfbeta")
+index.obs <- 1:nrow(dfb)
+coef_names <- colnames(dfb)
+
+# Save as PNG
+png("dfbeta_plots.png", width = 1800, height = 1800, res = 200)
+
+par(mfrow = c(3, 3),    # grid layout
+    mar = c(4, 4, 3, 1)) # margins
+
+for (j in 1:ncol(dfb)) {
+  plot(index.obs, dfb[, j], type = "h",
+       xlab = "Observation",
+       ylab = paste("DFBETA for", coef_names[j]),
+       main = coef_names[j])
+  abline(h = 0, col = "red")
+}
+
+dev.off()
+
+
+```
+
+
+
+
+Case-wise deletion diagnostics were evaluated using dfbeta residual plots for each covariate in the final Cox model. The dfbeta values were centered tightly around zero with no extreme spikes or outlying observations. This indicates that no individual case exerted undue influence on any of the regression coefficients, and the model appears stable to the removal of individual observations.
+
+
+
+
+
+
+# Risk groups and KM curves for Results
+
+```{r}
+fit_grade <- survfit(
+  Surv(Survival.Months, status_event) ~ Grade,
+  data = seer_train
+)
+
+ggsurvplot(
+  fit_grade,
+  data = seer_train,
+  risk.table = FALSE,      # <-- removed risk table
+  pval = TRUE,
+  conf.int = TRUE,
+  legend.title = "Tumor Grade",
+  xlab = "Months",
+  ylab = "Survival Probability",
+  ggtheme = theme_minimal(),
+  title = "Kaplan–Meier Curve by Tumor Grade"
+)
+
+
+```
+
+Higher tumor grade corresponds to worse survival. Grade I shows the best survival, whereas Grade III–IV decline sharply, indicating much more aggressive tumor biology. Survival curves differ significantly (p < 0.001).
+
+
+```{r}
+fit_race <- survfit(
+  Surv(Survival.Months, status_event) ~ Race,
+  data = seer_train
+)
+
+ggsurvplot(
+  fit_race,
+  data = seer_train,
+  risk.table = FALSE,      # <-- removed risk table
+  pval = TRUE,
+  conf.int = TRUE,
+  legend.title = "Race",
+  xlab = "Months",
+  ylab = "Survival Probability",
+  ggtheme = theme_minimal(),
+  title = "Kaplan–Meier Curve by Race"
+)
+
+```
+
+Racial groups have visibly different survival probabilities. The group with the highest curve maintains better long-term survival, while others decline earlier, suggesting disparities possibly related to access to care, tumor biology, or socioeconomic factors. The p-value indicates statistically significant differences.
+
+
+
+
+
+
+```{r}
+library(survival)
+library(survminer)
+library(patchwork)
+library(dplyr)
+
+## 1. Define the KM survival objects
+fit_grade <- survfit(Surv(Survival.Months, status_event) ~ Grade,
+                     data = seer_train)
+
+fit_nstage <- survfit(Surv(Survival.Months, status_event) ~ N.Stage,
+                      data = seer_train)
+
+fit_race <- survfit(Surv(Survival.Months, status_event) ~ Race,
+                    data = seer_train)
+
+fit_astage <- survfit(Surv(Survival.Months, status_event) ~ A.Stage,
+                      data = seer_train)
+
+km_theme <- theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 8),
+    axis.text  = element_text(size = 7)
+  )
+
+p_grade <- ggsurvplot(
+  fit_grade, data = seer_train, pval = TRUE, conf.int = TRUE,
+  title = "Tumor Grade", ggtheme = theme_minimal()
+)$plot + km_theme
+
+p_nstage <- ggsurvplot(
+  fit_nstage, data = seer_train, pval = TRUE, conf.int = TRUE,
+  title = "N Stage", ggtheme = theme_minimal()
+)$plot + km_theme
+
+p_race <- ggsurvplot(
+  fit_race, data = seer_train, pval = TRUE, conf.int = TRUE,
+  title = "Race", ggtheme = theme_minimal()
+)$plot + km_theme
+
+p_astage <- ggsurvplot(
+  fit_astage, data = seer_train, pval = TRUE, conf.int = TRUE,
+  title = "A Stage", ggtheme = theme_minimal()
+)$plot + km_theme
+
+```
+
+```{r}
+km_grid <- (p_grade | p_nstage) /
+           (p_race  | p_astage)
+
+km_grid
+ggsave("KM_4panel_patchwork.pdf", km_grid,
+       width = 10, height = 8)
+
+ggsave("KM_4panel_patchwork.png", km_grid,
+       width = 10, height = 8, dpi = 300)
+
+```
+
+
+#Part II: Comparison with prediction made with DeepSurv
+
+
+
+```{r}
+library(dnn)
+library(survival)
+library(survcomp)
+library(dplyr)
+
+set.seed(2025)
+
+## --------------------------------------------------
+## 1. Cox formula
+## --------------------------------------------------
+cox_formula <- Surv(Survival.Months, status_event) ~
+  Age + Race + Marital.Status + N.Stage + Grade + A.Stage +
+  Tumor.Size + Estrogen.Status + Progesterone.Status +
+  Regional.Node.Examined + Regional.Node.Positive
+
+## --------------------------------------------------
+## 2. Build design matrix (for DeepSurv input dimension)
+## --------------------------------------------------
+X_train <- model.matrix(cox_formula, data = seer_train)[, -1]  # drop intercept
+p <- ncol(X_train)
+
+## --------------------------------------------------
+## 3. Define DeepSurv network
+## --------------------------------------------------
+ds_model <- dNNmodel(
+  units       = c(64, 32, 1),           # two hidden layers + 1 output
+  activation  = c("relu", "relu", "idu"),
+  input_shape = p
+)
+
+## --------------------------------------------------
+## 4. Fit DeepSurv model on scaled TRAINING data
+## --------------------------------------------------
+seer_train_scaled <- seer_train %>%
+  mutate(
+    Tumor.Size             = scale(Tumor.Size),
+    Age                    = scale(Age),
+    Regional.Node.Examined = scale(Regional.Node.Examined),
+    Regional.Node.Positive = scale(Regional.Node.Positive)
+  )
+
+fit_deepsurv <- deepSurv(
+  formula    = cox_formula,
+  model      = ds_model,
+  data       = seer_train_scaled,
+  epochs     = 3000,
+  batch_size = 32,
+  lr_rate    = 1e-3,
+  alpha      = 0.7,
+  lambda     = 1,
+  verbose    = 1
+)
+
+## --------------------------------------------------
+## 5. C-index for stratified Cox model (validation)
+##     assumes cox_strat already fitted
+## --------------------------------------------------
+lp_cox_valid <- predict(cox_strat, newdata = seer_valid, type = "risk")
+
+c_index_cox <- concordance.index(
+  x          = lp_cox_valid,
+  surv.time  = seer_valid$Survival.Months,
+  surv.event = seer_valid$status_event
+)
+
+c_index_cox$c.index
+
+## --------------------------------------------------
+## 6. C-index for DeepSurv (validation)
+## --------------------------------------------------
+X_valid <- model.matrix(cox_formula, data = seer_valid)[, -1]
+
+pred_ds <- predict(fit_deepsurv, X_valid, type = "risk")
+
+# ensure numeric risk scores
+risk_ds <- as.numeric(pred_ds$risk)
+
+c_index_ds <- concordance.index(
+  x          = risk_ds,
+  surv.time  = seer_valid$Survival.Months,
+  surv.event = seer_valid$status_event)
+
+c_index_ds$c.index
+
+```
+
